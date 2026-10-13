@@ -4,6 +4,7 @@ from __future__ import annotations
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
+from urllib.parse import urlsplit
 
 from . import config
 
@@ -26,6 +27,8 @@ CREATE TABLE IF NOT EXISTS products (
   rights_confirmed INTEGER NOT NULL DEFAULT 0, source TEXT NOT NULL,
   collected_at TEXT NOT NULL, edited_at TEXT, UNIQUE(store_id, url)
 );
+CREATE TABLE IF NOT EXISTS banned_words (word TEXT PRIMARY KEY, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS blocked_stores (url TEXT PRIMARY KEY, name TEXT, reason TEXT, created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS crawl_log (
   id INTEGER PRIMARY KEY, at TEXT NOT NULL, level TEXT NOT NULL, target TEXT, message TEXT NOT NULL
 );
@@ -54,6 +57,72 @@ def connect():
         con.close()
 
 
+_STORE_HOSTS = {"smartstore.naver.com", "brand.naver.com"}
+
+
+def normalize_store_url(url: str) -> str:
+    """스토어 URL 비교용 정규화: 호스트 소문자, 스마트스토어/브랜드스토어는 첫 경로(스토어명)까지만, 쿼리 제거."""
+    u = (url or "").strip()
+    if u and "://" not in u:
+        u = "https://" + u
+    p = urlsplit(u)
+    host = p.netloc.lower()
+    seg = [x for x in p.path.split("/") if x]
+    if host in _STORE_HOSTS and seg:
+        return f"https://{host}/{seg[0].lower()}"
+    return f"https://{host}{p.path.rstrip('/')}"
+
+
+def block_store(url: str, name: str = "", reason: str = "") -> bool:
+    n = normalize_store_url(url)
+    if not urlsplit(n).netloc:
+        raise ValueError("올바른 스토어 URL이 아닙니다.")
+    with connect() as con:
+        return con.execute("INSERT OR IGNORE INTO blocked_stores(url,name,reason,created_at) VALUES(?,?,?,?)",
+                           (n, name, reason, now())).rowcount > 0
+
+
+def unblock_store(url: str) -> None:
+    with connect() as con:
+        con.execute("DELETE FROM blocked_stores WHERE url=?", (normalize_store_url(url),))
+
+
+def list_blocked() -> list[sqlite3.Row]:
+    with connect() as con:
+        return con.execute("SELECT * FROM blocked_stores ORDER BY created_at DESC").fetchall()
+
+
+def is_blocked(url: str | None) -> bool:
+    if not url:
+        return False
+    with connect() as con:
+        return con.execute("SELECT 1 FROM blocked_stores WHERE url=?", (normalize_store_url(url),)).fetchone() is not None
+
+
+def add_banned_word(word: str) -> bool:
+    w = word.strip()
+    if not w:
+        raise ValueError("금지어가 비어 있습니다.")
+    with connect() as con:
+        return con.execute("INSERT OR IGNORE INTO banned_words(word,created_at) VALUES(?,?)", (w, now())).rowcount > 0
+
+
+def remove_banned_word(word: str) -> None:
+    with connect() as con:
+        con.execute("DELETE FROM banned_words WHERE word=?", (word,))
+
+
+def list_banned_words() -> list[str]:
+    with connect() as con:
+        return [r["word"] for r in con.execute("SELECT word FROM banned_words ORDER BY created_at")]
+
+
+def find_banned_word(text: str | None) -> str | None:
+    """상품명에 포함된 첫 금지어(대소문자 무시, 부분 일치). 없으면 None."""
+    t = (text or "").lower()
+    return next((w for w in list_banned_words() if w.lower() in t), None)
+
+
 def log(level: str, target: str, message: str) -> None:
     with connect() as con:
         con.execute("INSERT INTO crawl_log(at,level,target,message) VALUES(?,?,?,?)", (now(), level, target, message))
@@ -61,6 +130,7 @@ def log(level: str, target: str, message: str) -> None:
 
 def add_discovered(rows: list[dict]) -> int:
     n = 0
+    rows = [r for r in rows if not is_blocked(r.get("store_url"))]
     with connect() as con:
         for r in rows:
             cur = con.execute(
@@ -75,14 +145,19 @@ def add_discovered(rows: list[dict]) -> int:
 def list_discovered(keyword: str | None = None) -> list[sqlite3.Row]:
     with connect() as con:
         if keyword:
-            return con.execute("SELECT * FROM discovered_stores WHERE keyword=? ORDER BY id", (keyword,)).fetchall()
-        return con.execute("SELECT * FROM discovered_stores ORDER BY id DESC").fetchall()
+            rows = con.execute("SELECT * FROM discovered_stores WHERE keyword=? ORDER BY id", (keyword,)).fetchall()
+        else:
+            rows = con.execute("SELECT * FROM discovered_stores ORDER BY id DESC").fetchall()
+    return [r for r in rows if not is_blocked(r["store_url"])]
 
 
 def collect_store(name: str, url: str, keyword: str, badge_status: str, badge_note: str = "") -> bool:
     """스토어를 저장. 이미 있으면 False(중복 방지), 새로 저장하면 True."""
     if badge_status == "has_badge":
         raise ValueError("뱃지가 있는 스토어는 수집 대상에서 제외됩니다.")
+    if is_blocked(url):
+        raise ValueError("수집 제외(차단) 스토어입니다.")
+    url = normalize_store_url(url)
     with connect() as con:
         cur = con.execute(
             "INSERT OR IGNORE INTO stores(name,url,keyword,badge_status,badge_note,collected_at) VALUES(?,?,?,?,?,?)",

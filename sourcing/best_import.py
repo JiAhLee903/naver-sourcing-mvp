@@ -55,8 +55,13 @@ def import_items(store_id: int, items: list[dict], limit: int | None = None, loc
     picked = [i for i in items if i.get("name") and str(i.get("is_best", True)).lower() not in ("false", "0", "n", "no", "")]
     if limit:
         picked = picked[:limit]
-    ok, fail = 0, 0
+    ok, fail, banned = 0, 0, 0
     for it in picked:
+        hit = db.find_banned_word(it["name"])
+        if hit:
+            banned += 1
+            db.log("info", it["name"], f"금지어 '{hit}' 포함 → 수집 제외")
+            continue
         try:
             add_product(store_id, it, local_images, source, rights_confirmed)
             ok += 1
@@ -64,8 +69,8 @@ def import_items(store_id: int, items: list[dict], limit: int | None = None, loc
             fail += 1
             db.log("error", it.get("name", "?"), f"상품 반입 실패: {type(e).__name__}: {e}")
     status = "collected" if fail == 0 and ok else ("partial" if ok else "failed")
-    db.set_best_status(store_id, status, f"반입 {ok}건 / 실패 {fail}건 / 입력 {len(items)}건")
-    return {"ok": ok, "fail": fail, "total": len(items)}
+    db.set_best_status(store_id, status, f"반입 {ok}건 / 금지어 제외 {banned}건 / 실패 {fail}건 / 입력 {len(items)}건")
+    return {"ok": ok, "banned": banned, "fail": fail, "total": len(items)}
 
 
 def parse_upload(filename: str, data: bytes) -> tuple[list[dict], dict[str, bytes]]:

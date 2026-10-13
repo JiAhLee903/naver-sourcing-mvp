@@ -58,7 +58,7 @@ def test_store_dedupe_and_badge_block():
 def test_sample_flow_and_export():
     db.collect_store("S", "https://s/s", "k", "no_badge")
     sid = db.list_stores()[0]["id"]
-    assert sample_data.load_sample_products(sid, 3, limit=2) == {"ok": 2, "fail": 0, "total": 3}
+    assert sample_data.load_sample_products(sid, 3, limit=2) == {"ok": 2, "banned": 0, "fail": 0, "total": 3}
     assert db.list_stores()[0]["best_status"] == "collected"
     rows = db.list_products(sid)
     assert len(rows) == 2 and "<script" not in rows[0]["detail_html_original"]
@@ -98,3 +98,29 @@ def test_import_dedupe_keeps_edits_and_limit():
 def test_image_validation():
     with pytest.raises(ValueError):
         images.save_image_bytes(1, b"not an image")
+
+
+def test_banned_words_skip_products():
+    db.collect_store("S", "https://s/s", "k", "no_badge")
+    sid = db.list_stores()[0]["id"]
+    db.add_banned_word("여성")
+    items = [{"name": "여성 블라우스", "url": "https://x/1"}, {"name": "남성 셔츠", "url": "https://x/2"},
+             {"name": "Women 여성용 원피스", "url": "https://x/3"}]
+    r = best_import.import_items(sid, items)
+    assert r["ok"] == 1 and r["banned"] == 2
+    assert [p["name"] for p in db.list_products(sid)] == ["남성 셔츠"]
+    db.remove_banned_word("여성")
+    assert db.find_banned_word("여성 블라우스") is None
+
+
+def test_blocked_store_not_discovered_or_collected():
+    assert db.block_store("https://smartstore.naver.com/Bad/products/12?x=1", reason="수동") is True
+    assert db.block_store("https://smartstore.naver.com/bad", reason="중복") is False  # 정규화로 같은 스토어
+    assert db.is_blocked("smartstore.naver.com/bad/")
+    assert db.add_discovered([{"keyword": "k", "store_name": "B", "store_url": "https://smartstore.naver.com/bad",
+                               "source": "t"}, {"keyword": "k", "store_name": "G", "store_url": "https://smartstore.naver.com/good",
+                                                "source": "t"}]) == 1
+    with pytest.raises(ValueError):
+        db.collect_store("B", "https://smartstore.naver.com/bad", "k", "no_badge")
+    db.unblock_store("https://smartstore.naver.com/bad")
+    assert db.collect_store("B", "https://smartstore.naver.com/bad", "k", "no_badge") is True

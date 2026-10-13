@@ -11,7 +11,7 @@ from sourcing import badge_filter, best_import, config, db, export, html_tools, 
 
 st.set_page_config(page_title="해외직구 소싱 MVP", layout="wide")
 DEMO = os.environ.get("DEMO_MODE") == "1"  # 공개 배포용: 샘플 데이터만, API 키 입력/외부 요청 비활성화
-PAGES = ["1. 스토어 검색", "2. 수집된 스토어", "3. 수집된 상품", "4. 상세페이지 편집", "로그/상태"]
+PAGES = ["1. 스토어 검색", "2. 수집된 스토어", "3. 수집된 상품", "4. 상세페이지 편집", "5. 수집 설정", "로그/상태"]
 st.session_state.setdefault("page", PAGES[0])
 if "_nav" in st.session_state:  # 라디오 위젯 생성 전에만 page 값을 바꿀 수 있다
     st.session_state["page"] = st.session_state.pop("_nav")
@@ -76,7 +76,7 @@ if page == PAGES[0]:
         found = db.list_discovered(kw)
         st.subheader(f"'{kw}' 발견 스토어 {len(found)}곳")
         st.info("뱃지는 자동 판별하지 않습니다(스마트스토어 접근이 robots.txt로 금지). 스토어를 직접 열어 확인한 뒤 "
-                "'뱃지 상태'를 지정하세요. '뱃지 있음'은 수집에서 제외됩니다.")
+                "'뱃지 상태'를 지정하세요. '뱃지 있음'은 수집하지 않고 제외 목록에 등록됩니다. 제외 스토어는 결과에 나타나지 않습니다.")
         existing = {s["url"] for s in db.list_stores()}
         df = pd.DataFrame([{
             "선택": False, "스토어명": r["store_name"], "스토어 URL": r["store_url"] or "(URL 미확인)",
@@ -85,14 +85,18 @@ if page == PAGES[0]:
         edited = st.data_editor(df, hide_index=True, use_container_width=True, disabled=["스토어명", "스토어 URL", "대표 상품", "발견 경로", "이미 수집"],
                                 column_config={"뱃지 상태": st.column_config.SelectboxColumn(options=list(db.BADGE_LABELS.values()))})
         if st.button("선택한 스토어 수집"):
-            added = skipped = 0
+            added = 0
+            # 뱃지 있음 → 수집하지 않고 차단 목록에 올려 이후 검색 결과에서도 숨긴다
+            for _, r in edited.iterrows():
+                if badge_filter.status_from_label(r["뱃지 상태"]) == "has_badge" and r["스토어 URL"].startswith("http"):
+                    db.block_store(r["스토어 URL"], r["스토어명"], "뱃지 있음")
             for _, r in edited[edited["선택"]].iterrows():
                 status = badge_filter.status_from_label(r["뱃지 상태"])
-                if not r["스토어 URL"].startswith("http") or not badge_filter.is_collectable(status):
-                    skipped += 1
+                if (not r["스토어 URL"].startswith("http") or not badge_filter.is_collectable(status)
+                        or db.is_blocked(r["스토어 URL"])):
                     continue
                 added += db.collect_store(r["스토어명"], r["스토어 URL"], kw, status)
-            st.success(f"신규 저장 {added}곳, 제외/중복/URL 없음 {len(edited[edited['선택']]) - added}곳")
+            st.success(f"신규 저장 {added}곳. 뱃지 있음 스토어는 제외 목록에 등록했습니다(수집 설정에서 해제 가능).")
 
 # ---------------------------------------------------------------- 화면 2
 elif page == PAGES[1]:
@@ -119,12 +123,13 @@ elif page == PAGES[1]:
                     try:
                         items, imgs = best_import.parse_upload(up.name, up.getvalue())
                         r = best_import.import_items(s["id"], items, limit or None, imgs, rights_confirmed=rights)
-                        st.success(f"{r}")
+                        st.success(f"반입 {r['ok']}건 · 금지어 제외 {r['banned']}건 · 실패 {r['fail']}건")
                     except Exception as e:  # noqa: BLE001
                         db.log("error", s["url"], f"반입 실패: {e}")
                         st.error(f"반입 실패: {e}")
                 if st.button("샘플 상품 불러오기(테스트용)", key=f"smp{s['id']}"):
-                    st.success(sample_data.load_sample_products(s["id"], 3, limit or None))
+                    r = sample_data.load_sample_products(s["id"], 3, limit or None)
+                    st.success(f"반입 {r['ok']}건 · 금지어 제외 {r['banned']}건")
                 st.caption("스마트스토어 BEST 목록을 자동으로 읽지 않습니다(robots.txt 금지). 'BEST 여부'는 데이터의 is_best 값을 따릅니다.")
             if st.button("상품 보기", key=f"vw{s['id']}"):
                 go(PAGES[2], store_filter=s["id"])
@@ -239,6 +244,42 @@ elif page == PAGES[3]:
         d4.download_button("전체 결과 ZIP", export.all_zip(db.list_products()), "all_products.zip", "application/zip")
     else:
         st.warning("사용 권한 확인 체크 전에는 HTML/이미지/ZIP 다운로드가 비활성화됩니다.")
+
+# ---------------------------------------------------------------- 수집 설정
+elif page == PAGES[4]:
+    st.header("수집 설정")
+    st.subheader("금지어")
+    st.caption("상품명에 금지어가 들어 있으면 상품 수집(반입)에서 제외됩니다. 대소문자 구분 없이 부분 일치합니다. 예: '여성' → '여성 블라우스' 제외")
+    c1, c2 = st.columns([4, 1])
+    word = c1.text_input("금지어 추가 (쉼표로 여러 개)", key="bw_in", label_visibility="collapsed", placeholder="예: 여성, 아동")
+    if c2.button("추가"):
+        for w in word.split(","):
+            if w.strip():
+                db.add_banned_word(w)
+        st.rerun()
+    for w in db.list_banned_words():
+        a, b = st.columns([6, 1])
+        a.write(f"🚫 {w}")
+        if b.button("삭제", key=f"bw_{w}"):
+            db.remove_banned_word(w)
+            st.rerun()
+    st.divider()
+    st.subheader("수집 제외 스토어")
+    st.caption("여기 등록된 스토어는 검색 결과에 표시되지 않고 수집되지 않습니다. 뱃지 있는 스토어는 자동 등록됩니다.")
+    c1, c2 = st.columns([4, 1])
+    link = c1.text_input("스토어 링크", key="bs_in", label_visibility="collapsed", placeholder="https://smartstore.naver.com/스토어명")
+    if c2.button("제외 등록"):
+        try:
+            db.block_store(link, reason="수동 등록")
+            st.rerun()
+        except ValueError as e:
+            st.error(str(e))
+    for r in db.list_blocked():
+        a, b = st.columns([6, 1])
+        a.write(f"⛔ {r['name'] or ''} {r['url']}  · {r['reason'] or ''}")
+        if b.button("해제", key=f"bs_{r['url']}"):
+            db.unblock_store(r["url"])
+            st.rerun()
 
 # ---------------------------------------------------------------- 로그
 else:

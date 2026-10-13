@@ -36,3 +36,15 @@ def test_screens_with_sample_data():
     assert len(html_tools.list_images(p["detail_html_edited"])) == 3
     assert len(html_tools.list_images(p["detail_html_original"])) == 4
     assert not at.exception
+
+
+def test_settings_page_banned_word_and_blocked_store():
+    at = _app().run()
+    at.session_state["page"] = "5. 수집 설정"
+    at.run()
+    at.text_input(key="bw_in").set_value("여성").run()
+    next(b for b in at.button if b.label == "추가").click().run()
+    at.text_input(key="bs_in").set_value("https://smartstore.naver.com/badshop").run()
+    next(b for b in at.button if b.label == "제외 등록").click().run()
+    assert not at.exception
+    assert db.list_banned_words() == ["여성"] and db.is_blocked("https://smartstore.naver.com/badshop")
